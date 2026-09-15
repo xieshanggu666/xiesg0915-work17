@@ -22,6 +22,11 @@
 内置标准/严格/宽松三套预设，也可用 JSON 配置文件或命令行 `--set` 单项调整，
 每次报告（Excel「判定阈值」表、JSON、平面图标注、控制台）都会注明本次使用的阈值方案。
 
+此外，管理员可把**核查项开关 + 阈值 + 放行条件**组合成**可命名、可版本化的
+企业规则包**（`rulepack` 子命令），指定适用项目与阶段；发布后各项目核查时
+自动按项目 / 阶段匹配规则包版本，报告标注所用规则包版本与指纹以便追溯，
+详见下文「企业审查规则库」。
+
 支持**多模型批量核查与项目质量看板**（`batch` 子命令）：一次纳入项目下
 多个单体 IFC，按项目 / 单体 / 楼层汇总问题分布、净面积与门窗规格指标，
 按批次留存结果形成趋势对比，并由可配置的放行门禁在质量不达标时阻断放行，
@@ -80,6 +85,134 @@ python -m ifc_audit.cli gui
 | `sample_标注平面图.png` | 平面图：墙/房间/门窗 + 问题编号 + 围护缺口红线 + 异常/未归属门窗圈标 |
 | `sample_三维标注.png` | 三维轴测标注图（无 GPU 环境自动用 matplotlib 渲染） |
 | `sample_结果.json` | 机器可读的完整结果（含门窗明细与门窗表） |
+
+## 企业审查规则库
+
+管理员把**核查项、阈值、放行条件**组合成**可命名、可版本化的规则包**，
+指定**适用项目与阶段**；发布后各项目核查时自动按项目 / 阶段匹配规则包版本，
+每份报告（单体 Excel / 标注图 / JSON、批次 Excel / 看板 / JSON）都标注
+所用规则包的**名称@版本与内容指纹**，事后可凭版本精确追溯当时的核查口径。
+
+规则库默认位于 `output/rule_library/`（`--rule-lib` 可改），目录结构：
+
+```
+<规则库>/
+  index.json                         # 库索引
+  drafts/<名称>.json                  # 可编辑草稿（改草稿不影响已发布版本）
+  published/<名称>/<版本>.json         # 不可变发布快照（含 sha256 内容指纹）
+```
+
+### 管理规则包（rulepack 子命令）
+
+```bash
+# 1) 新建草稿（核查项全开；可指定适用项目/阶段，可重复；不给则适用全部）
+python -m ifc_audit.cli rulepack init 住宅施工图审查 \
+    --description "施工图阶段企业审查标准" \
+    --project 花园小区一期 --project 花园路9号院 \
+    --stage construction_drawing --profile default
+
+# 2) 直接编辑草稿 JSON：checks 开关核查项、thresholds 阈值覆盖、
+#    gate_rules 放行条件覆盖、applicability 项目/阶段
+#    草稿位于 output/rule_library/drafts/住宅施工图审查.json
+
+# 也可在库外生成带中文说明的草稿模板，编辑后用 publish --as-name 入库
+python -m ifc_audit.cli rulepack template rules.json \
+    --name 住宅施工图审查 --stage construction_drawing
+
+# 3) 发布为不可变版本（语义化版本 主.次.修；同名同版本不可重复发布）
+python -m ifc_audit.cli rulepack publish 住宅施工图审查 1.0.0 --by 张工
+# 草稿再改不影响 1.0.0；调整后发布 1.1.0，老版本保留可追溯
+python -m ifc_audit.cli rulepack publish 住宅施工图审查 1.1.0 --by 张工
+
+# 列表 / 查看 / 废止（废止后不参与自动选择，快照仍保留）
+python -m ifc_audit.cli rulepack list
+python -m ifc_audit.cli rulepack show 住宅施工图审查@1.0.0
+python -m ifc_audit.cli rulepack deprecate 住宅施工图审查 1.0.0
+```
+
+适用阶段取值：`scheme`（方案）/ `construction_drawing`（施工图）/
+`submission`（提模审查）/ `completion`（竣工）。
+
+草稿 JSON 结构（要点）：
+
+```json
+{
+  "name": "住宅施工图审查",
+  "description": "施工图阶段企业审查标准",
+  "applicability": { "projects": ["花园小区一期"], "stages": ["construction_drawing"] },
+  "checks": {
+    "wall_closure": true,
+    "room_envelope": true,
+    "duplicate_element": true,
+    "room_area": true,
+    "opening_size": true,
+    "opening_assignment": true
+  },
+  "threshold_profile": "default",
+  "thresholds": { "gap_min_len_mm": 50, "area_dev_warn_pct": 1 },
+  "gate_profile": "default",
+  "gate_rules": { "unit_max_warnings": 20, "unit_max_open_rooms": 3 }
+}
+```
+
+六个核查项：`wall_closure`（未闭合的墙）、`room_envelope`（房间围护缺口）、
+`duplicate_element`（重复构件）、`room_area`（房间净面积缺声明/偏差）、
+`opening_size`（门窗尺寸异常）、`opening_assignment`（门窗未归属）。
+关闭某核查项后：相关问题不再产生、清单中不再标异常，对应的放行门禁规则
+**自动不参与判定**（如关闭重复构件则重复组数门禁跳过，关闭任一核查项则
+错误 / 警告总数门禁跳过，避免“不核查却仍按 0 阻断”）；房间净面积清单、
+门窗表等**统计清单始终生成**，不受核查开关影响。
+
+### 按规则包核查
+
+```bash
+# 批量：默认就会按 --project/--stage 从规则库自动选择适用的已发布包
+python -m ifc_audit.cli batch ifc目录/ --project 花园小区一期 \
+    --stage construction_drawing
+# 规则库中没有适用包时自动回退内置预设（--no-rule-pack 可显式关闭选择）
+
+# 显式指定：库内名称（取最新版）、名称@版本、或发布快照 JSON 文件
+python -m ifc_audit.cli batch ifc目录/ --project 花园小区一期 \
+    --rule-pack 住宅施工图审查@1.0.0
+python -m ifc_audit.cli batch ifc目录/ --project 花园小区一期 \
+    --rule-pack /shared/rules/住宅施工图审查_1.0.0.json
+
+# 单模型核查：显式 --use-rule-pack 自动选择，或 --rule-pack 指定
+python -m ifc_audit.cli audit model.ifc --use-rule-pack \
+    --project 花园小区一期 --stage construction_drawing
+python -m ifc_audit.cli audit model.ifc --rule-pack 住宅施工图审查@1.0.0
+```
+
+自动选择按**相关度打分**：项目精确命中 > 全项目；阶段精确命中 > 全阶段；
+同分取版本更高、发布更新者；已废止版本不参与。
+
+为保证报告版本严格可追溯，使用规则包时**不允许同时**指定
+`--profile/--config/--set/--gate-profile/--gate-config/--gate-set`
+（需要不同口径时应发布新版本的规则包），否则以退出码 2 报错。
+
+### 报告中的版本标注
+
+- 单体 Excel「汇总」与「判定阈值」表：规则包名称@版本、指纹、适用范围、
+  发布时间、**每个核查项的启用/关闭状态**；平面标注图页脚打印规则包版本；
+  `*_结果.json` 顶层新增 `rule_pack` 段；
+- 批次 Excel「批次概览」「阈值与门禁」表：规则包版本/指纹/适用范围、
+  核查项开关、每条门禁的「生效 / 不参与（核查项关闭）」状态；
+  项目质量看板标题条、批次 JSON（`rule_pack` 与 `enabled_checks` 段）同样标注；
+- 规则包快照带 **sha256 内容指纹**，快照被改动后载入会直接报错，
+  确保发布版本不可篡改。
+
+作为 Python 库调用：
+
+```python
+from ifc_audit.rule_packs import RulePackLibrary, materialize
+from ifc_audit.batch import run_batch_with_rule_pack
+
+lib = RulePackLibrary("output/rule_library")
+pack = lib.select_for("花园小区一期", "construction_drawing")  # 或 load_published(名, 版本)
+mat = materialize(pack)          # 物化为阈值 / 门禁 / 启用核查项 + 追溯引用
+batch = run_batch_with_rule_pack(["ifc目录/"], mat, project="花园小区一期")
+print(batch.rule_pack["id"], batch.rule_pack["content_hash"])
+```
 
 ## 多模型批量核查与项目质量看板
 
@@ -379,6 +512,7 @@ ifc_audit/
   extract.py     IFC 提取墙/门/窗/房间
   thresholds.py  判定阈值：预设 / 配置文件 / 命令行覆盖
   gate.py        放行门禁：规则 / 预设 / 配置解析 / 模板导出
+  rule_packs.py  企业审查规则库：规则包草稿 / 发布版本化 / 适用范围选择 / 物化
   checks.py      重复构件、自由端、墙段缺口、房间围护
   rooms.py       房间净面积清单
   openings.py    门窗规格清单（门窗表 / 异常 / 未归属）
@@ -388,7 +522,7 @@ ifc_audit/
   viewer.py      PyVista 三维查看器 + matplotlib 三维回退
   viewer_win.py  独立进程 PyVista 窗口
   gui.py         Tkinter 图形界面
-  cli.py         命令行入口（audit / batch / trend / init-gate / gui）
+  cli.py         命令行入口（audit / batch / trend / rulepack / init-gate / gui）
   pipeline.py    流程编排
 tools/
   make_sample_ifc.py  样例模型生成

@@ -33,6 +33,7 @@ from .gate import (
     QualityGate, GateProvenance, DEFAULT_GATE, META as GATE_META,
     resolve_gate,
 )
+from .rule_packs import enabled_checks_from_kinds
 
 # 支持的 IFC 后缀
 IFC_SUFFIXES = (".ifc", ".ifcxml", ".ifczip")
@@ -100,6 +101,7 @@ class UnitResult:
     opening_unassigned: int = 0
 
     threshold_describe: str = ""
+    rule_pack: Optional[dict] = None
     storeys: list[StoreyAgg] = field(default_factory=list)
 
     # 核查模型仅在本次运行内保留（供导出单体报告 / 看板取数），不进快照
@@ -150,6 +152,7 @@ class UnitResult:
             "open_room_ratio": round(self.open_room_ratio, 4),
             "anomaly_ratio": round(self.anomaly_ratio, 4),
             "threshold_describe": self.threshold_describe,
+            "rule_pack": self.rule_pack,
             "storeys": [s.to_dict() for s in self.storeys],
         }
 
@@ -187,6 +190,8 @@ class BatchResult:
     gate_results: list[GateRuleResult]
     trend: dict = field(default_factory=dict)
     history_dir: str = ""
+    rule_pack: Optional[dict] = None
+    enabled_checks: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -201,6 +206,8 @@ class BatchResult:
             "gate_passed": self.gate_passed,
             "gate_results": [r.to_dict() for r in self.gate_results],
             "trend": self.trend,
+            "rule_pack": self.rule_pack,
+            "enabled_checks": list(self.enabled_checks),
             "units": [u.to_dict() for u in self.units],
             "storeys": [s.to_dict() for s in self.storeys],
         }
@@ -328,6 +335,8 @@ def _aggregate_unit(name: str, file_path: str, model: AuditModel) -> UnitResult:
     u.opening_anomaly = s["openings_size_anomaly"]
     prov = getattr(model, "threshold_provenance", None)
     u.threshold_describe = prov.describe() if prov else ""
+    pack_ref = getattr(model, "rule_pack", None)
+    u.rule_pack = pack_ref.to_dict() if pack_ref is not None else None
 
     # 楼层行
     rows: dict[str, StoreyAgg] = {}
@@ -413,8 +422,15 @@ _PCT = "%"
 
 
 def evaluate_gate(units: list[UnitResult], gate: QualityGate,
-                  project: str) -> list[GateRuleResult]:
-    """逐单体 + 项目 + 批次完整性评估全部启用的门禁规则。"""
+                  project: str,
+                  disabled_keys: Optional[set[str]] = None
+                  ) -> list[GateRuleResult]:
+    """逐单体 + 项目 + 批次完整性评估全部启用的门禁规则。
+
+    disabled_keys 中的规则键不参与判定（企业规则包关闭对应核查项时，
+    相关放行条件失去统计意义，由调用方传入）。
+    """
+    disabled_keys = disabled_keys or set()
     results: list[GateRuleResult] = []
 
     def add(level, scope, key, actual, passed, message, actual_shown=None):
@@ -455,6 +471,8 @@ def evaluate_gate(units: list[UnitResult], gate: QualityGate,
         ]
         for key, actual, shown in checks:
             spec = GATE_META[key]
+            if key in disabled_keys:
+                continue  # 对应核查项已被规则包关闭
             limit = getattr(gate, spec.attr)
             if limit < 0:
                 continue  # 规则关闭
@@ -481,6 +499,8 @@ def evaluate_gate(units: list[UnitResult], gate: QualityGate,
     ]
     for key, actual, shown in proj_checks:
         spec = GATE_META[key]
+        if key in disabled_keys:
+            continue  # 对应核查项已被规则包关闭
         limit = getattr(gate, spec.attr)
         if key == "min_units":
             passed = actual >= limit
@@ -555,6 +575,9 @@ def run_batch(paths: list[str],
               gate_provenance: Optional[GateProvenance] = None,
               thresholds: Optional[Thresholds] = None,
               threshold_provenance: Optional[ThresholdProvenance] = None,
+              enabled_kinds: Optional[set[str]] = None,
+              rule_pack=None,
+              disabled_gate_keys: Optional[set[str]] = None,
               progress: Optional[Callable[[int, str], None]] = None
               ) -> BatchResult:
     """批量核查多个 IFC 文件并完成聚合与门禁判定。
@@ -566,6 +589,9 @@ def run_batch(paths: list[str],
         gate: 放行规则；默认 :data:`~ifc_audit.gate.DEFAULT_GATE`。
         gate_provenance: 放行规则来源说明。
         thresholds / threshold_provenance: 单模型核查阈值（默认 default 预设）。
+        enabled_kinds: 启用的问题种类集合（规则包关闭部分核查项时收窄）。
+        rule_pack: 企业规则包引用（RulePackRef），随批次结果进报告以便追溯。
+        disabled_gate_keys: 因核查项关闭而不参与判定的门禁规则键。
         progress: 进度回调 ``progress(percent, message)``。
     """
     def report(pct, msg):
@@ -599,7 +625,9 @@ def run_batch(paths: list[str],
                           progress(_b + int(p / 100 * (_e - _b)), m))
                 if progress else None,
                 thresholds=thresholds,
-                provenance=threshold_provenance)
+                provenance=threshold_provenance,
+                enabled_kinds=enabled_kinds,
+                rule_pack=rule_pack)
             units.append(_aggregate_unit(name, fp, model))
         except Exception as exc:  # 单体失败不拖垮整批
             units.append(UnitResult(
@@ -608,7 +636,8 @@ def run_batch(paths: list[str],
 
     all_storeys = [s for u in units for s in u.storeys]
     totals = _project_totals(units)
-    gate_results = evaluate_gate(units, gate, project)
+    gate_results = evaluate_gate(units, gate, project,
+                                 disabled_keys=disabled_gate_keys)
     # 门禁关闭（none 预设）时不阻断；启用时全部规则通过才放行
     passed = (not gate.enabled) or all(r.passed for r in gate_results)
 
@@ -626,9 +655,12 @@ def run_batch(paths: list[str],
             "provenance": gate_provenance.to_dict() if gate_provenance else None,
             "description": gate_provenance.describe() if gate_provenance else "",
             "enabled": gate.enabled,
+            "disabled_keys": sorted(disabled_gate_keys or []),
         },
         gate_passed=passed,
         gate_results=gate_results,
+        rule_pack=rule_pack.to_dict() if rule_pack is not None else None,
+        enabled_checks=enabled_checks_from_kinds(enabled_kinds),
     )
 
 
@@ -652,6 +684,29 @@ def run_batch_with_config(paths: list[str],
                      gate=gate, gate_provenance=gate_prov,
                      thresholds=th, threshold_provenance=th_prov,
                      progress=progress)
+
+
+def run_batch_with_rule_pack(paths: list[str],
+                             materialized,
+                             project: str = "未命名项目",
+                             label: str = "",
+                             progress: Optional[Callable[[int, str], None]] = None
+                             ) -> BatchResult:
+    """便捷入口：用已物化的企业规则包执行批量核查。
+
+    Args:
+        materialized: :func:`ifc_audit.rule_packs.materialize` 的结果。
+    """
+    from .rule_packs import disabled_gate_keys
+    return run_batch(
+        paths, project=project, label=label,
+        gate=materialized.gate, gate_provenance=materialized.gate_provenance,
+        thresholds=materialized.thresholds,
+        threshold_provenance=materialized.threshold_provenance,
+        enabled_kinds=materialized.enabled_kinds,
+        rule_pack=materialized.ref,
+        disabled_gate_keys=disabled_gate_keys(materialized.enabled_checks),
+        progress=progress)
 
 
 # ---------------------------------------------------------------- 趋势 ----
@@ -715,6 +770,8 @@ def build_trend(batch: BatchResult, previous: Optional[dict]) -> dict:
         "previous_label": previous.get("label", ""),
         "previous_created_at": previous.get("created_at"),
         "previous_gate_passed": previous.get("gate_passed"),
+        "previous_rule_pack_id": previous.get("rule_pack_id")
+        or (previous.get("rule_pack") or {}).get("id", ""),
         "deltas": deltas,
         "unit_delta": unit_delta,
         "units_new": [n for n in cur_units if n not in prev_units],
@@ -729,6 +786,7 @@ def _history_point(batch: BatchResult) -> dict:
         "label": batch.label,
         "created_at": batch.created_at,
         "gate_passed": batch.gate_passed,
+        "rule_pack_id": (batch.rule_pack or {}).get("id", ""),
         "issues": batch.totals["issues"],
         "errors": batch.totals["errors"],
         "warnings": batch.totals["warnings"],
@@ -780,6 +838,7 @@ def save_batch_snapshot(batch: BatchResult, history_dir: str) -> str:
         "errors": batch.totals["errors"],
         "warnings": batch.totals["warnings"],
         "issues": batch.totals["issues"],
+        "rule_pack_id": (batch.rule_pack or {}).get("id", ""),
         "snapshot": os.path.relpath(path, pdir),
     }
     index["batches"] = [b for b in index.get("batches", [])
@@ -821,11 +880,14 @@ def attach_trend(batch: BatchResult, history_dir: str) -> BatchResult:
             "label": h.get("label", ""),
             "created_at": h.get("created_at"),
             "gate_passed": h.get("gate_passed"),
+            "rule_pack_id": h.get("rule_pack_id")
+            or (h.get("rule_pack") or {}).get("id", ""),
             "issues": ht.get("issues"),
             "errors": ht.get("errors"),
             "warnings": ht.get("warnings"),
             "total_net_area": ht.get("total_net_area"),
         })
+    # build_trend 的 previous 取最后一个快照，规则包版本同样优先全量快照
     trend["history"] = points + [_history_point(batch)]
     batch.trend = trend
     batch.history_dir = history_dir

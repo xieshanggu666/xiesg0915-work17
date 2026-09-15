@@ -59,6 +59,22 @@ def export_batch_excel(batch: BatchResult, out_path: str) -> str:
         ("批次编号", batch.batch_id),
         ("批次标签", batch.label or "-"),
         ("核查时间", batch.created_at),
+    ]
+    pack = getattr(batch, "rule_pack", None)
+    if pack:
+        from .rule_packs import STAGE_CN
+        pj = "、".join(pack.get("projects") or []) or "全部项目"
+        ps = "、".join(STAGE_CN.get(s, s) for s in pack.get("stages") or []) \
+            or "全部阶段"
+        rows += [
+            ("企业规则包", pack["id"]),
+            ("规则包指纹", pack.get("content_hash", "")),
+            ("规则包适用范围", f"{pj} / {ps}"),
+            ("规则包发布时间", pack.get("published_at") or "-"),
+        ]
+    else:
+        rows.append(("企业规则包", "未使用（内置预设 + 命令行参数）"))
+    rows += [
         ("纳入单体数", f"{t['units']}（成功 {t['units'] - t['units_failed']} / "
                      f"失败 {t['units_failed']}）"),
         ("构件数量（墙/门/窗/房间）",
@@ -225,10 +241,18 @@ def export_batch_excel(batch: BatchResult, out_path: str) -> str:
     ws = wb.create_sheet("趋势对比")
     tr = batch.trend or {}
     if tr.get("has_previous"):
+        cur_pack = (getattr(batch, "rule_pack", None) or {}).get("id", "")
+        prev_pack = tr.get("previous_rule_pack_id") or ""
         ws.append([
             f"上一批次：{tr.get('previous_batch_id')} "
             f"{tr.get('previous_label') or ''} "
             f"({tr.get('previous_created_at')})",
+        ])
+        ws.append([
+            "规则包版本",
+            prev_pack or "内置预设",
+            cur_pack or "内置预设",
+            "版本一致" if cur_pack == prev_pack else "版本已切换（口径可能变化）",
         ])
         ws.append(["指标", "上一批次", "本批次", "变化", "方向"])
         for key, d in tr.get("deltas", {}).items():
@@ -258,15 +282,43 @@ def export_batch_excel(batch: BatchResult, out_path: str) -> str:
 
     # 8) 阈值与门禁
     ws = wb.create_sheet("阈值与门禁")
+    if getattr(batch, "rule_pack", None):
+        rp = batch.rule_pack
+        from .rule_packs import (
+            CHECKS, CHECK_CN, STAGE_CN,
+        )
+        ws.append(["企业规则包", rp["id"]])
+        ws.append(["规则包指纹", rp.get("content_hash", "")])
+        ws.append(["发布时间", rp.get("published_at") or "-"])
+        ws.append(["适用项目", "、".join(rp.get("projects") or []) or "全部项目"])
+        ws.append(["适用阶段",
+                   "、".join(STAGE_CN.get(s, s) for s in rp.get("stages") or [])
+                   or "全部阶段"])
+        ws.append([])
+        ws.append(["核查项", "状态", "标识"])
+        check_hdr = ws.max_row
+        enabled = set(getattr(batch, "enabled_checks", []) or [])
+        for c in CHECKS:
+            on = c in enabled
+            ws.append([CHECK_CN[c], "启用" if on else "关闭", c])
+        ws.append([])
     ws.append(["门禁方案", batch.gate.get("description") or "-"])
-    ws.append(["分组", "规则", "本次取值", "配置键"])
+    gate_title_row = ws.max_row
+    disabled = set(batch.gate.get("disabled_keys") or [])
+    ws.append(["分组", "规则", "本次取值", "配置键", "状态"])
+    header_row = ws.max_row
     # 直接用快照值重建 QualityGate
     from .gate import QualityGate
     qg = QualityGate(**batch.gate["values"])
     for row in gate_rows_for_report(qg):
-        ws.append(list(row))
-    _style_header(ws, 4, row=2, fill="C00000")
-    ws.cell(row=1, column=1).font = Font(bold=True)
+        ws.append(list(row) + ["不参与（核查项关闭）" if row[3] in disabled else "生效"])
+    _style_header(ws, 5, row=header_row, fill="C00000")
+    if getattr(batch, "rule_pack", None):
+        for c in range(1, 4):
+            cell = ws.cell(row=check_hdr, column=c)
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill("solid", fgColor="D9E1F2")
+    ws.cell(row=gate_title_row, column=1).font = Font(bold=True)
     _autosize(ws)
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
@@ -316,6 +368,13 @@ def export_dashboard(batch: BatchResult, out_path: str) -> str:
         f"　单体 {t['units']} 个（失败 {t['units_failed']}）",
         transform=ax_head.transAxes, fontsize=10.5, va="center",
         color="#444")
+    if getattr(batch, "rule_pack", None):
+        rp = batch.rule_pack
+        ax_head.text(
+            0.01, 0.02,
+            f"企业规则包：{rp['id']}（指纹 {rp.get('content_hash', '')}）",
+            transform=ax_head.transAxes, fontsize=9, va="center",
+            color="#1a237e", fontweight="bold")
     ax_head.text(
         0.99, 0.55, verdict, transform=ax_head.transAxes, fontsize=16,
         fontweight="bold", va="center", ha="right", color=verdict_color)
@@ -466,6 +525,11 @@ def export_dashboard(batch: BatchResult, out_path: str) -> str:
     if len(history) >= 2:
         xs = list(range(len(history)))
         xlabels = [h.get("created_at", "")[5:19] for h in history]
+        # 批次使用的规则包版本标注在每个刻度下，口径切换一眼可见
+        pack_labels = [
+            (h.get("rule_pack_id") or "内置预设").split("@")[-1]
+            for h in history
+        ]
         ax7.plot(xs, [h.get("issues", 0) for h in history], "o-",
                  color="#37474f", label="问题总数", lw=1.8)
         ax7.plot(xs, [h.get("errors", 0) for h in history], "s-",
@@ -480,7 +544,9 @@ def export_dashboard(batch: BatchResult, out_path: str) -> str:
                          fontsize=7, color="#c62828", ha="center", va="top",
                          fontweight="bold")
         ax7.set_xticks(xs)
-        ax7.set_xticklabels(xlabels)
+        ax7.set_xticklabels([f"{t}\n规则包:{p}"
+                             for t, p in zip(xlabels, pack_labels)],
+                            fontsize=7)
         ax7.margins(y=0.18)
         ax7.legend(fontsize=8, ncol=3, loc="upper left")
     else:
@@ -529,6 +595,7 @@ def export_trend_chart(batch: BatchResult, out_path: str) -> str:
     fig, ax = plt.subplots(figsize=(11, 5), dpi=140)
     if len(history) >= 2:
         xs = [h.get("created_at", "")[5:19] for h in history]
+        packs = [(h.get("rule_pack_id") or "内置预设") for h in history]
         ax.plot(xs, [h.get("issues", 0) for h in history], "o-",
                 color="#37474f", label="问题总数", lw=1.8)
         ax.plot(xs, [h.get("errors", 0) for h in history], "s-",
@@ -538,6 +605,9 @@ def export_trend_chart(batch: BatchResult, out_path: str) -> str:
         for i, h in enumerate(history):
             if not h.get("gate_passed", True):
                 ax.axvspan(i - 0.3, i + 0.3, color="#c62828", alpha=0.08)
+        ax.set_xticks(range(len(xs)))
+        ax.set_xticklabels([f"{t}\n{p}" for t, p in zip(xs, packs)],
+                           fontsize=7)
         ax.legend()
     else:
         ax.text(0.5, 0.5, "历史批次不足 2 个，暂无趋势可对比",

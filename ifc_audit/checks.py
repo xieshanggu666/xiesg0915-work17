@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import itertools
 from collections import defaultdict
+from typing import Optional
 
 import numpy as np
 from shapely.geometry import Point
@@ -43,8 +44,15 @@ def _iou(a, b) -> float:
 
 
 def find_duplicates(model: AuditModel,
-                    th: Thresholds = DEFAULT_THRESHOLDS) -> None:
-    """检测重复构件：同类型、形心重合且几何（体积/轮廓）基本相同。"""
+                    th: Thresholds = DEFAULT_THRESHOLDS,
+                    emit: bool = True) -> None:
+    """检测重复构件：同类型、形心重合且几何（体积/轮廓）基本相同。
+
+    emit=False 时只清空历史分组、不做检测也不产生问题（规则包关闭该核查项）。
+    """
+    if not emit:
+        model.duplicate_groups = []
+        return
     parent = {}
 
     def find(x):
@@ -126,8 +134,11 @@ def _wall_barrier(model: AuditModel, exclude_id: str | None = None):
 
 
 def find_wall_closures(model: AuditModel,
-                       th: Thresholds = DEFAULT_THRESHOLDS) -> None:
+                       th: Thresholds = DEFAULT_THRESHOLDS,
+                       emit: bool = True) -> None:
     """检测自由墙端与墙间缺口。"""
+    if not emit:
+        return
     walls = [e for e in model.by_type(WALL) if e.axis is not None]
     # 每条墙用“其它墙”的联合做端点测试
     all_wall_fp = unary_union([e.footprint for e in walls if e.footprint is not None]) \
@@ -209,8 +220,11 @@ def find_wall_closures(model: AuditModel,
 
 
 def find_room_enclosure(model: AuditModel,
-                        th: Thresholds = DEFAULT_THRESHOLDS) -> None:
+                        th: Thresholds = DEFAULT_THRESHOLDS,
+                        emit: bool = True) -> None:
     """逐房间检查围护边界：墙身与门扇覆盖不到的边界段即围护缺口。"""
+    if not emit:
+        return
     barriers = [e.footprint for e in model.by_type(WALL) if e.footprint is not None]
     # 门用凸包（完整门扇）覆盖门洞；窗不参与围护
     barriers += [e.footprint for e in model.by_type(DOOR) if e.footprint is not None]
@@ -273,10 +287,25 @@ def find_room_enclosure(model: AuditModel,
 
 
 def run_all_checks(model: AuditModel,
-                   th: Thresholds = DEFAULT_THRESHOLDS) -> AuditModel:
-    find_duplicates(model, th)
-    find_wall_closures(model, th)
-    find_room_enclosure(model, th)
+                   th: Thresholds = DEFAULT_THRESHOLDS,
+                   enabled_kinds: Optional[set[str]] = None) -> AuditModel:
+    """执行几何类核查；enabled_kinds 给定时只启用问题种类在集合内的核查项。
+
+    核查项与问题种类的映射见 :data:`ifc_audit.rule_packs.CHECK_ISSUE_KINDS`。
+    """
+    from .rule_packs import (
+        CHECK_DUPLICATE, CHECK_WALL_CLOSURE, CHECK_ROOM_ENVELOPE,
+        CHECK_ISSUE_KINDS,
+    )
+
+    def _enabled(check: str) -> bool:
+        if enabled_kinds is None:
+            return True
+        return any(k in enabled_kinds for k in CHECK_ISSUE_KINDS[check])
+
+    find_duplicates(model, th, emit=_enabled(CHECK_DUPLICATE))
+    find_wall_closures(model, th, emit=_enabled(CHECK_WALL_CLOSURE))
+    find_room_enclosure(model, th, emit=_enabled(CHECK_ROOM_ENVELOPE))
     # 按楼层、位置排序，报告更稳定
     model.issues.sort(key=lambda i: (i.storey, i.kind, i.issue_id))
     return model

@@ -71,9 +71,19 @@ def export_excel(model: AuditModel, out_path: str) -> str:
     ws.title = "汇总"
     s = model.summary()
     prov = getattr(model, "threshold_provenance", None)
+    pack = getattr(model, "rule_pack", None)
+    pack_scope = ""
+    if pack is not None:
+        from .rule_packs import STAGE_CN
+        pj = "、".join(pack.projects) if pack.projects else "全部项目"
+        ps = "、".join(STAGE_CN.get(s, s) for s in pack.stages) \
+            if pack.stages else "全部阶段"
+        pack_scope = f"（适用 {pj} / {ps}，发布于 {pack.published_at or '-'}）"
     rows = [
         ("指标", "数值"),
         ("IFC 文件", s["file"]),
+        ("企业规则包",
+         f"{pack.id}  指纹 {pack.content_hash}{pack_scope}" if pack else "未使用（内置预设）"),
         ("墙体数量", s["walls"]),
         ("门数量", s["doors"]),
         ("窗数量", s["windows"]),
@@ -94,19 +104,46 @@ def export_excel(model: AuditModel, out_path: str) -> str:
 
     # 2) 判定阈值（本次核查实际使用的一套，含来源）
     ws = wb.create_sheet("判定阈值")
+    if pack is not None:
+        ws.append(["企业规则包", pack.id])
+        ws.append(["规则包指纹", pack.content_hash])
+        ws.append(["适用项目", "、".join(pack.projects) if pack.projects else "全部项目"])
+        from .rule_packs import STAGE_CN
+        ws.append(["适用阶段",
+                   "、".join(STAGE_CN.get(s, s) for s in pack.stages)
+                   if pack.stages else "全部阶段"])
+        ws.append(["发布时间", pack.published_at or "-"])
     ws.append(["本次判定阈值方案", prov.describe() if prov else "标准（内置默认）"])
+    th_title_row = ws.max_row
     ws.append(["分组", "判定项", "本次取值", "配置键"])
-    header_row = 2
+    header_row = ws.max_row
     if getattr(model, "thresholds", None) is not None:
         from .thresholds import rows_for_report
         for row in rows_for_report(model.thresholds):
             ws.append(list(row))
+    # 规则包核查项开关（追溯本次实际核查了哪些项）
+    if pack is not None:
+        from .rule_packs import check_rows_for_report, CHECKS
+        ws.append([])
+        ws.append(["核查项（规则包配置）", "是否启用", "标识", ""])
+        checks_title_row = ws.max_row
+        enabled = {}
+        kinds = getattr(model, "enabled_kinds", None)
+        from .rule_packs import CHECK_ISSUE_KINDS
+        for c in CHECKS:
+            enabled[c] = kinds is None or any(k in kinds for k in CHECK_ISSUE_KINDS[c])
+        for label_cn, on, key in check_rows_for_report(enabled):
+            ws.append([label_cn, "启用" if on else "关闭", key, ""])
+        for c in range(1, 5):
+            cell = ws.cell(row=checks_title_row, column=c)
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill("solid", fgColor="D9E1F2")
     for c in range(1, 5):
         cell = ws.cell(row=header_row, column=c)
         cell.font = hdr_font
         cell.fill = hdr_fill
         cell.alignment = Alignment(horizontal="center")
-    ws.cell(row=1, column=1).font = Font(bold=True)
+    ws.cell(row=th_title_row, column=1).font = Font(bold=True)
     _autosize(ws)
 
     # 2) 问题清单
@@ -440,8 +477,15 @@ def export_annotated_plan(model: AuditModel, out_path: str,
 
     # 注明本次使用的阈值方案
     prov = getattr(model, "threshold_provenance", None)
+    pack = getattr(model, "rule_pack", None)
+    footer_y = 0.015
+    if pack is not None:
+        fig.text(0.02, 0.045,
+                 f"企业规则包：{mt(pack.id)}（版本指纹 {pack.content_hash}）",
+                 fontsize=7.5, va="bottom", color="#1a237e",
+                 family="sans-serif", fontweight="bold")
     if prov is not None:
-        fig.text(0.02, 0.015, f"判定阈值：{mt(prov.describe())}",
+        fig.text(0.02, footer_y, f"判定阈值：{mt(prov.describe())}",
                  fontsize=7, va="bottom", color="#555555",
                  family="sans-serif")
 

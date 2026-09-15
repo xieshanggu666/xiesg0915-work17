@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from typing import Optional
 
 from .model import (
     AuditModel, Issue, OpeningItem, OpeningScheduleRow, DOOR, WINDOW,
@@ -83,8 +84,18 @@ def _size_check(kind: str, width: float, height: float, th: Thresholds):
 
 
 def build_opening_schedule(model: AuditModel,
-                           th: Thresholds = DEFAULT_THRESHOLDS) -> AuditModel:
-    """按本次阈值生成门窗明细、门窗表与异常问题。"""
+                           th: Thresholds = DEFAULT_THRESHOLDS,
+                           enabled_kinds: Optional[set[str]] = None
+                           ) -> AuditModel:
+    """按本次阈值生成门窗明细、门窗表与异常问题。
+
+    门窗明细 / 门窗表始终生成；``enabled_kinds`` 给定时，被关闭核查项的
+    问题不产生，明细上的异常 / 未归属标记也不计（与门禁口径一致）。
+    """
+    emit_unassigned = enabled_kinds is None \
+        or "opening_unassigned" in enabled_kinds
+    emit_anomaly = enabled_kinds is None \
+        or "opening_size_anomaly" in enabled_kinds
     # 房间 GlobalId -> RoomArea（归属信息在房间清单阶段已生成）
     room_map = {r.global_id: r for r in model.rooms}
 
@@ -110,9 +121,10 @@ def build_opening_schedule(model: AuditModel,
         assigned = assigned_rooms(e)
         room_ids = [g for g, _ in assigned]
         room_names = [n for _, n in assigned]
-        unassigned = not assigned
+        unassigned = (not assigned) and emit_unassigned
         anomalous, notes = _size_check(
             kind, e.width, e.dim_height, th)
+        anomalous = anomalous and emit_anomaly
 
         item = OpeningItem(
             global_id=e.global_id,

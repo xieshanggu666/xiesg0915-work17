@@ -28,10 +28,202 @@ from .gate import (
     write_gate_config_template,
 )
 from .batch import (
-    run_batch_with_config, attach_trend, save_batch_snapshot,
-    load_project_history,
+    run_batch_with_config, run_batch_with_rule_pack, attach_trend,
+    save_batch_snapshot, load_project_history,
 )
 from . import batch_report
+from .rule_packs import (
+    RulePackLibrary, RulePackError, CHECKS, CHECK_CN,
+    STAGES, STAGE_CN, DEFAULT_RULE_LIBRARY, new_draft, write_draft_template,
+    resolve_rule_pack, materialize,
+)
+
+
+# ------------------------------------------------------- 规则库子命令 ----
+
+def _rule_lib(args) -> RulePackLibrary:
+    return RulePackLibrary(getattr(args, "rule_lib", None)
+                           or DEFAULT_RULE_LIBRARY)
+
+
+def _add_rule_pack_args(parser, auto_flag: bool = False) -> None:
+    """audit / batch 共用的规则包参数。"""
+    parser.add_argument("--rule-lib", default=DEFAULT_RULE_LIBRARY,
+                        help=f"企业规则库目录（默认 {DEFAULT_RULE_LIBRARY}）")
+    parser.add_argument("--rule-pack", default=None, metavar="名称[@版本]|快照.json",
+                        help="显式指定企业规则包：库内名称（最新版）、名称@版本，"
+                             "或已发布快照 JSON 文件路径")
+    if auto_flag:
+        parser.add_argument("--use-rule-pack", dest="rule_pack_auto",
+                            action="store_true",
+                            help="不指定 --rule-pack 时，按项目/阶段从规则库"
+                                 "自动选择适用的已发布规则包")
+    parser.add_argument("--stage", choices=STAGES, default="",
+                        help="项目阶段（自动选择规则包用）："
+                             + " / ".join(f"{k}={v}" for k, v in STAGE_CN.items()))
+
+
+def _print_pack_row(item: dict) -> None:
+    scope_p = "、".join(item["projects"]) if item["projects"] else "全部项目"
+    scope_s = "、".join(STAGE_CN.get(s, s) for s in item["stages"]) \
+        if item["stages"] else "全部阶段"
+    flags = []
+    if item["deprecated"]:
+        flags.append("最新版已废止")
+    if item["has_draft"]:
+        flags.append("有未发布草稿")
+    print(f"  {item['name']:<20} v{item['latest'] or '-':<10} "
+          f"{item['n_versions']} 个版本  [{scope_p} / {scope_s}]"
+          f"{'  （' + '，'.join(flags) + '）' if flags else ''}")
+    if item["description"]:
+        print(f"    └ {item['description']}")
+
+
+def _cmd_rulepack_list(args) -> int:
+    lib = _rule_lib(args)
+    items = lib.list_packs()
+    if not items:
+        print(f"规则库（{lib.root}）中还没有规则包。"
+              "可用 `rulepack init` 创建第一份草稿。")
+        return 0
+    print(f"规则库：{lib.root}（共 {len(items)} 个规则包）")
+    for item in items:
+        _print_pack_row(item)
+    return 0
+
+
+def _cmd_rulepack_init(args) -> int:
+    lib = _rule_lib(args)
+    lib.init()
+    content = new_draft(
+        args.name, description=args.description or "",
+        projects=args.project or [], stages=args.stage or [],
+        threshold_profile=args.profile,
+        gate_profile=("loose" if args.profile == "loose" else "default"))
+    try:
+        path = lib.save_draft(content)
+    except RulePackError as exc:
+        print(f"规则包错误：{exc}", file=sys.stderr)
+        return 2
+    print(f"规则包草稿已创建：{path}")
+    print(f"核查项全开；阈值预设 {args.profile}。编辑草稿后发布：")
+    print(f"  python -m ifc_audit.cli rulepack publish {args.name} "
+          f"1.0.0 --rule-lib {lib.root}")
+    return 0
+
+
+def _cmd_rulepack_show(args) -> int:
+    lib = _rule_lib(args)
+    try:
+        pack = resolve_rule_pack(args.spec, lib)
+    except RulePackError as exc:
+        print(f"规则包错误：{exc}", file=sys.stderr)
+        return 2
+    print(f"规则包        : {pack.id}")
+    print(f"说明          : {pack.description or '-'}")
+    print(f"适用项目      : {'、'.join(pack.projects) if pack.projects else '全部项目'}")
+    print(f"适用阶段      : "
+          f"{'、'.join(STAGE_CN.get(s, s) for s in pack.stages) if pack.stages else '全部阶段'}")
+    print(f"发布时间 / 人 : {pack.published_at} / {pack.published_by or '-'}")
+    print(f"内容指纹      : {pack.content_hash}")
+    if pack.deprecated:
+        print("状态          : 已废止（不参与自动选择）")
+    print("核查项：")
+    for c in CHECKS:
+        on = pack.checks.get(c, True)
+        print(f"  [{'x' if on else ' '}] {CHECK_CN[c]}（{c}）")
+    print(f"判定阈值      : 预设 {pack.threshold_profile}"
+          + (f"，覆盖 {len(pack.thresholds)} 项" if pack.thresholds else ""))
+    for k, v in sorted(pack.thresholds.items()):
+        print(f"    {k} = {v}")
+    print(f"放行门禁      : 预设 {pack.gate_profile}"
+          + (f"，覆盖 {len(pack.gate_rules)} 项" if pack.gate_rules else ""))
+    for k, v in sorted(pack.gate_rules.items()):
+        print(f"    {k} = {v}")
+    return 0
+
+
+def _cmd_rulepack_publish(args) -> int:
+    lib = _rule_lib(args)
+    try:
+        pack = lib.publish(args.source, args.version,
+                           published_by=args.by or "",
+                           as_name=args.as_name)
+    except RulePackError as exc:
+        print(f"规则包错误：{exc}", file=sys.stderr)
+        return 2
+    print(f"已发布规则包 {pack.id}（不可变）")
+    print(f"快照：{pack.path}")
+    print(f"适用：{'、'.join(pack.projects) or '全部项目'} / "
+          f"{'、'.join(STAGE_CN.get(s, s) for s in pack.stages) or '全部阶段'}")
+    print(f"指纹：{pack.content_hash}")
+    return 0
+
+
+def _cmd_rulepack_template(args) -> int:
+    if os.path.exists(args.path):
+        print(f"已存在同名文件，未覆盖：{args.path}", file=sys.stderr)
+        return 2
+    content = new_draft(
+        args.name, projects=args.project or [], stages=args.stage or [],
+        threshold_profile=args.profile)
+    write_draft_template(args.path, content)
+    print(f"规则包草稿模板已生成：{args.path}")
+    print("编辑后发布：python -m ifc_audit.cli rulepack publish "
+          f"{args.path} 1.0.0 --as-name {args.name}")
+    return 0
+
+
+def _cmd_rulepack_deprecate(args) -> int:
+    lib = _rule_lib(args)
+    try:
+        lib.set_deprecated(args.name, args.version, not args.undo)
+    except RulePackError as exc:
+        print(f"规则包错误：{exc}", file=sys.stderr)
+        return 2
+    action = "废止" if not args.undo else "取消废止"
+    print(f"已{action}规则包 {args.name}@{args.version}")
+    return 0
+
+
+def _resolve_materialized(args, optional: bool = False) -> tuple[object, int]:
+    """按命令行参数解析并物化规则包；失败返回 (None, 退出码)。
+
+    optional=True 时（批量自动选择），库不存在 / 无适用规则包等“未配置”
+    情况返回 (None, 0) 由调用方回退普通模式；显式指定的错误仍然报错。
+    """
+    lib = _rule_lib(args)
+    try:
+        if getattr(args, "rule_pack", None):
+            pack = resolve_rule_pack(args.rule_pack, lib)
+        else:
+            pack = lib.select_for(args.project, getattr(args, "stage", "") or "")
+        return materialize(pack), 0
+    except RulePackError as exc:
+        if optional and not getattr(args, "rule_pack", None):
+            if not args.quiet:
+                print(f"[info] 未使用企业规则包（{exc}），改用内置预设。")
+            return None, 0
+        print(f"规则包错误：{exc}", file=sys.stderr)
+        return None, 2
+
+
+def _rule_pack_conflict(args) -> str:
+    """规则包与手动阈值 / 门禁参数互斥（保证报告版本可追溯）；返回冲突项描述。"""
+    conflicts = []
+    if getattr(args, "profile", "default") != "default":
+        conflicts.append(f"--profile {args.profile}")
+    if getattr(args, "config", None):
+        conflicts.append(f"--config {args.config}")
+    if getattr(args, "set_threshold", None):
+        conflicts.append("--set")
+    if getattr(args, "gate_profile", "default") != "default":
+        conflicts.append(f"--gate-profile {args.gate_profile}")
+    if getattr(args, "gate_config", None):
+        conflicts.append("--gate-config")
+    if getattr(args, "gate_set", None):
+        conflicts.append("--gate-set")
+    return "、".join(conflicts)
 
 
 def _cmd_audit(args) -> int:
@@ -45,10 +237,27 @@ def _cmd_audit(args) -> int:
 
     try:
         overrides = parse_set_items(args.set_threshold)
-        model = audit_ifc_with_config(
-            args.ifc, progress=progress if not args.quiet else None,
-            profile=args.profile, config_path=args.config,
-            overrides=overrides or None)
+        if getattr(args, "rule_pack_auto", False) or getattr(args, "rule_pack", None):
+            conflict = _rule_pack_conflict(args)
+            if conflict:
+                print(f"配置冲突：使用规则包时不允许同时指定 {conflict}"
+                      "（规则包版本必须可追溯）", file=sys.stderr)
+                return 2
+            mat, rc = _resolve_materialized(args)
+            if rc:
+                return rc
+            model = audit_ifc(
+                args.ifc, progress=progress if not args.quiet else None,
+                thresholds=mat.thresholds,
+                provenance=mat.threshold_provenance,
+                enabled_kinds=mat.enabled_kinds, rule_pack=mat.ref)
+            pack_info = mat.ref
+        else:
+            model = audit_ifc_with_config(
+                args.ifc, progress=progress if not args.quiet else None,
+                profile=args.profile, config_path=args.config,
+                overrides=overrides or None)
+            pack_info = None
     except ThresholdConfigError as exc:
         print(f"阈值配置错误：{exc}", file=sys.stderr)
         return 2
@@ -56,6 +265,9 @@ def _cmd_audit(args) -> int:
 
     print("\n================ 核查汇总 ================")
     print(f"文件        : {s['file']}")
+    if pack_info is not None:
+        print(f"规则包      : {pack_info.describe()}")
+        print(f"规则包指纹  : {pack_info.content_hash}")
     print(f"墙体/门/窗  : {s['walls']} / {s['doors']} / {s['windows']}")
     print(f"房间        : {s['rooms']}    净面积合计: {s['total_net_area']} m²")
     print(f"问题        : {s['issues']} 条 (错误 {s['errors']} / 警告 {s['warnings']})")
@@ -126,6 +338,7 @@ def _cmd_audit(args) -> int:
     from dataclasses import asdict
     dump = {
         "summary": s,
+        "rule_pack": pack_info.to_dict() if pack_info is not None else None,
         "thresholds": {
             "values": asdict(model.thresholds) if model.thresholds else None,
             "provenance": (model.threshold_provenance.to_dict()
@@ -174,6 +387,8 @@ def _print_batch_summary(batch) -> None:
     print(f"净面积合计  : {t['total_net_area']} m2；不闭合房间 {t['rooms_open']} 间")
     print(f"门窗        : 共 {t['opening_total']} 樘，"
           f"尺寸异常 {t['opening_anomaly']}，未归属 {t['opening_unassigned']}")
+    if batch.rule_pack:
+        print(f"规则包      : {batch.rule_pack['id']}（指纹 {batch.rule_pack['content_hash']}）")
     print(f"核查阈值    : {next((u.threshold_describe for u in batch.units if u.ok), '-')}")
     print(f"门禁方案    : {batch.gate.get('description') or '-'}")
 
@@ -200,6 +415,14 @@ def _print_batch_summary(batch) -> None:
         print("\n---------------- 趋势对比（相对上一批次）----------------")
         print(f"上一批次：{tr.get('previous_batch_id')} "
               f"{tr.get('previous_label') or ''}（{tr.get('previous_created_at')}）")
+        prev_pack = tr.get("previous_rule_pack_id") or ""
+        cur_pack = (batch.rule_pack or {}).get("id", "")
+        if cur_pack or prev_pack:
+            if cur_pack == prev_pack:
+                print(f"规则包    : {cur_pack or '未使用'}（与上一批次一致）")
+            else:
+                print(f"规则包    : {prev_pack or '未使用（内置预设）'} → "
+                      f"{cur_pack or '未使用（内置预设）'}（版本已切换，指标口径可能变化）")
         for key, d in tr.get("deltas", {}).items():
             delta = d["delta"]
             if delta == 0:
@@ -270,19 +493,41 @@ def _cmd_batch(args) -> int:
     try:
         overrides = parse_set_items(args.set_threshold)
         gate_overrides = parse_gate_set_items(args.gate_set)
-        batch = run_batch_with_config(
-            args.paths,
-            project=args.project,
-            label=args.label or "",
-            threshold_profile=args.profile,
-            threshold_config=args.config,
-            threshold_overrides=overrides or None,
-            gate_profile=("none" if args.no_gate else args.gate_profile),
-            gate_config=(None if args.no_gate else args.gate_config),
-            gate_overrides=(None if args.no_gate else (gate_overrides or None)),
-            progress=progress if not args.quiet else None)
+        use_pack = args.rule_pack or (
+            getattr(args, "use_rule_pack", False)
+            and not getattr(args, "no_rule_pack", False))
+        mat = None
+        if use_pack:
+            if args.rule_pack:
+                conflict = _rule_pack_conflict(args)
+                if conflict:
+                    print(f"配置冲突：使用规则包时不允许同时指定 {conflict}"
+                          "（规则包版本必须可追溯）", file=sys.stderr)
+                    return 2
+            # 批量场景：库内没有适用规则包时静默回退普通模式（显式指定除外）
+            mat, rc = _resolve_materialized(
+                args, optional=not bool(args.rule_pack))
+            if rc:
+                return rc
+        if mat is not None:
+            batch = run_batch_with_rule_pack(
+                args.paths, mat,
+                project=args.project, label=args.label or "",
+                progress=progress if not args.quiet else None)
+        else:
+            batch = run_batch_with_config(
+                args.paths,
+                project=args.project,
+                label=args.label or "",
+                threshold_profile=args.profile,
+                threshold_config=args.config,
+                threshold_overrides=overrides or None,
+                gate_profile=("none" if args.no_gate else args.gate_profile),
+                gate_config=(None if args.no_gate else args.gate_config),
+                gate_overrides=(None if args.no_gate else (gate_overrides or None)),
+                progress=progress if not args.quiet else None)
         attach_trend(batch, history_dir)
-    except (ThresholdConfigError, GateConfigError) as exc:
+    except (ThresholdConfigError, GateConfigError, RulePackError) as exc:
         print(f"配置错误：{exc}", file=sys.stderr)
         return 2
     except FileNotFoundError as exc:
@@ -328,11 +573,14 @@ def _cmd_trend(args) -> int:
         print(f"项目“{args.project}”没有历史批次记录。", file=sys.stderr)
         return 2
     print(f"项目“{args.project}”共 {len(history)} 个批次：\n")
-    print(f"{'批次':<18}{'标签':<14}{'时间':<22}{'单体':>4}"
-          f"{'问题':>5}{'错误':>5}{'警告':>5}  放行")
+    print(f"{'批次':<18}{'标签':<12}{'规则包':<22}{'时间':<22}"
+          f"{'单体':>4}{'问题':>5}{'错误':>5}{'警告':>5}  放行")
     for h in history:
-        print(f"{h.get('batch_id', ''):<20}{(h.get('label') or '-'):<14}"
-              f"{h.get('created_at', ''):<22}{h.get('n_files', h.get('n_units', 0)):>4}"
+        pack_id = h.get("rule_pack_id") or (h.get("rule_pack") or {}).get("id") \
+            or "(内置预设)"
+        print(f"{h.get('batch_id', ''):<20}{(h.get('label') or '-'):<12}"
+              f"{pack_id:<24}{h.get('created_at', ''):<22}"
+              f"{h.get('n_files', h.get('n_units', 0)):>4}"
               f"{h.get('totals', {}).get('issues', h.get('issues', 0)):>5}"
               f"{h.get('totals', {}).get('errors', h.get('errors', 0)):>5}"
               f"{h.get('totals', {}).get('warnings', h.get('warnings', 0)):>5}  "
@@ -361,6 +609,8 @@ def _cmd_trend(args) -> int:
                 {k: h.get(k) for k in (
                     "batch_id", "label", "created_at", "gate_passed",
                     "issues", "errors", "warnings", "total_net_area")}
+                | {"rule_pack_id": h.get("rule_pack_id")
+                   or (h.get("rule_pack") or {}).get("id", "")}
                 for h in history]})
         p = batch_report.export_trend_chart(fake, args.output)
         print(f"\n趋势图已导出：{p}")
@@ -391,6 +641,9 @@ def main(argv=None) -> int:
         metavar="KEY=VALUE",
                          help="单项覆盖阈值，可重复，长度 mm / 偏差 %%。"
                               "例如 --set gap_min_len_mm=50 --set area_dev_warn_pct=1")
+    _add_rule_pack_args(p_audit, auto_flag=True)
+    # 单模型自动选择规则包时用项目名匹配；帮助中不突出（主要场景是批量）
+    p_audit.add_argument("--project", default="未命名项目", help=argparse.SUPPRESS)
     p_audit.set_defaults(func=_cmd_audit)
 
     p_gui = sub.add_parser("gui", help="启动图形界面")
@@ -433,7 +686,21 @@ def main(argv=None) -> int:
                               "--gate-set unit_max_warnings=20")
     p_batch.add_argument("--no-gate", action="store_true",
                          help="本次不启用门禁（等同 --gate-profile none，仅统计不阻断）")
-    p_batch.set_defaults(func=_cmd_batch)
+    # 企业审查规则包（发布后的规则包按项目/阶段自动匹配，也可显式指定）
+    p_batch.add_argument("--rule-lib", default=DEFAULT_RULE_LIBRARY,
+                         help=f"企业规则库目录（默认 {DEFAULT_RULE_LIBRARY}）")
+    p_batch.add_argument("--rule-pack", default=None,
+                         metavar="名称[@版本]|快照.json",
+                         help="显式指定企业规则包；不给定时按 --project/--stage "
+                              "从规则库自动选择适用的已发布规则包")
+    p_batch.add_argument("--stage", choices=STAGES, default="",
+                         help="项目阶段（自动选择规则包用）："
+                              + " / ".join(f"{k}={v}" for k, v in STAGE_CN.items()))
+    p_batch.add_argument("--no-rule-pack", dest="no_rule_pack",
+                         action="store_true",
+                         help="即使规则库中存在适用规则包也不使用，"
+                              "改用 --profile/--gate-profile 等普通参数")
+    p_batch.set_defaults(use_rule_pack=True, func=_cmd_batch)
 
     # ---- 批次历史趋势 ----
     p_trend = sub.add_parser(
@@ -458,6 +725,69 @@ def main(argv=None) -> int:
     p_init_gate.add_argument("--profile", choices=GATE_PROFILES, default="default",
                              help="模板以哪套门禁预设为初始值（默认 default）")
     p_init_gate.set_defaults(func=_cmd_init_gate)
+
+    # ---- 企业审查规则库 ----
+    p_rp = sub.add_parser(
+        "rulepack", help="企业审查规则库：规则包草稿 / 发布 / 版本 / 适用范围")
+    rp_sub = p_rp.add_subparsers(dest="rulepack_command", required=True)
+
+    p_rp_list = rp_sub.add_parser("list", help="列出规则库内全部规则包与版本")
+    p_rp_list.add_argument("--rule-lib", default=DEFAULT_RULE_LIBRARY,
+                           help=f"规则库目录（默认 {DEFAULT_RULE_LIBRARY}）")
+    p_rp_list.set_defaults(func=_cmd_rulepack_list)
+
+    p_rp_init = rp_sub.add_parser(
+        "init", help="在规则库中创建规则包草稿（核查项全开，可再编辑）")
+    p_rp_init.add_argument("name", help="规则包名称，如 住宅施工图审查规则")
+    p_rp_init.add_argument("--description", default="", help="规则包用途说明")
+    p_rp_init.add_argument("--project", action="append", default=[],
+                           help="适用项目名，可重复；不给则适用全部项目")
+    p_rp_init.add_argument("--stage", choices=STAGES, action="append", default=[],
+                           help="适用阶段，可重复；不给则适用全部阶段")
+    p_rp_init.add_argument("--profile", choices=PROFILES, default="default",
+                           help="以哪套阈值预设为草稿初始值（默认 default）")
+    p_rp_init.add_argument("--rule-lib", default=DEFAULT_RULE_LIBRARY,
+                           help=f"规则库目录（默认 {DEFAULT_RULE_LIBRARY}）")
+    p_rp_init.set_defaults(func=_cmd_rulepack_init)
+
+    p_rp_pub = rp_sub.add_parser(
+        "publish", help="发布草稿为不可变版本快照（同名同版本不可重复发布）")
+    p_rp_pub.add_argument("source",
+                          help="库内规则包名（取其草稿）或草稿 JSON 文件路径")
+    p_rp_pub.add_argument("version", help="语义化版本号，如 1.0.0")
+    p_rp_pub.add_argument("--as-name", default=None,
+                          help="从库外草稿文件发布时指定规则包名称")
+    p_rp_pub.add_argument("--by", default="", help="发布人（记录在快照中）")
+    p_rp_pub.add_argument("--rule-lib", default=DEFAULT_RULE_LIBRARY,
+                          help=f"规则库目录（默认 {DEFAULT_RULE_LIBRARY}）")
+    p_rp_pub.set_defaults(func=_cmd_rulepack_publish)
+
+    p_rp_show = rp_sub.add_parser("show", help="查看规则包内容（核查项/阈值/门禁）")
+    p_rp_show.add_argument("spec", help="规则包名称、名称@版本或快照 JSON 路径")
+    p_rp_show.add_argument("--rule-lib", default=DEFAULT_RULE_LIBRARY,
+                           help=f"规则库目录（默认 {DEFAULT_RULE_LIBRARY}）")
+    p_rp_show.set_defaults(func=_cmd_rulepack_show)
+
+    p_rp_dep = rp_sub.add_parser(
+        "deprecate", help="标记某版本废止（不参与自动选择；快照不删除）")
+    p_rp_dep.add_argument("name", help="规则包名称")
+    p_rp_dep.add_argument("version", help="版本号")
+    p_rp_dep.add_argument("--undo", action="store_true", help="取消废止标记")
+    p_rp_dep.add_argument("--rule-lib", default=DEFAULT_RULE_LIBRARY,
+                          help=f"规则库目录（默认 {DEFAULT_RULE_LIBRARY}）")
+    p_rp_dep.set_defaults(func=_cmd_rulepack_deprecate)
+
+    p_rp_tpl = rp_sub.add_parser(
+        "template", help="在任意目录生成带说明的规则包草稿模板 JSON")
+    p_rp_tpl.add_argument("path", help="模板输出路径，如 rules.json")
+    p_rp_tpl.add_argument("--name", default="企业审查规则包", help="规则包名称")
+    p_rp_tpl.add_argument("--project", action="append", default=[],
+                          help="适用项目名，可重复；不给则全部项目")
+    p_rp_tpl.add_argument("--stage", choices=STAGES, action="append", default=[],
+                          help="适用阶段，可重复；不给则全部阶段")
+    p_rp_tpl.add_argument("--profile", choices=PROFILES, default="default",
+                          help="以哪套阈值预设为初始值（默认 default）")
+    p_rp_tpl.set_defaults(func=_cmd_rulepack_template)
 
     args = parser.parse_args(argv)
     return args.func(args)

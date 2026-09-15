@@ -248,9 +248,13 @@ class GateProvenance:
     base_profile: str = "default"
     config_path: Optional[str] = None
     overrides: dict[str, object] = field(default_factory=dict)
+    rule_pack_id: Optional[str] = None  # 来自企业规则包时记 “名称@版本”
 
     def describe(self) -> str:
-        parts = [GATE_PROFILE_CN.get(self.profile, self.profile)]
+        parts = []
+        if self.rule_pack_id:
+            parts.append(f"规则包 {self.rule_pack_id}")
+        parts.append(GATE_PROFILE_CN.get(self.profile, self.profile))
         if self.config_path:
             parts.append(f"配置文件 {self.config_path}")
         if self.overrides:
@@ -267,6 +271,7 @@ class GateProvenance:
             "base_profile": self.base_profile,
             "config_path": self.config_path,
             "overrides": self.overrides,
+            "rule_pack_id": self.rule_pack_id,
             "description": self.describe(),
         }
 

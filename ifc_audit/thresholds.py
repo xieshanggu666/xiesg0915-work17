@@ -219,6 +219,7 @@ class ThresholdProvenance:
     base_profile: str = "default"     # 覆盖前的基准预设名
     config_path: Optional[str] = None
     overrides: dict[str, float] = field(default_factory=dict)  # 用户键 -> 用户值
+    rule_pack_id: Optional[str] = None  # 来自企业规则包时记 “名称@版本”
 
     def describe(self) -> str:
         """一句话说明本次用的是哪套阈值（只列相对预设真正改动的项）。"""
@@ -229,6 +230,8 @@ class ThresholdProvenance:
             if abs(spec.from_user(val) - getattr(base, spec.attr)) > 1e-12:
                 changed.append(f"{key}={_format_user(key, val)}")
         parts = [PROFILE_CN.get(self.profile, self.profile)]
+        if self.rule_pack_id:
+            parts.insert(0, f"规则包 {self.rule_pack_id}")
         if self.config_path:
             parts.append(f"配置文件 {self.config_path}")
         if changed:
@@ -237,7 +240,7 @@ class ThresholdProvenance:
 
     def is_default(self) -> bool:
         return self.profile == "default" and not self.config_path \
-            and not self.overrides
+            and not self.overrides and not self.rule_pack_id
 
     def to_dict(self) -> dict:
         return {
@@ -246,6 +249,7 @@ class ThresholdProvenance:
             "base_profile": self.base_profile,
             "config_path": self.config_path,
             "overrides": self.overrides,
+            "rule_pack_id": self.rule_pack_id,
             "description": self.describe(),
         }
 

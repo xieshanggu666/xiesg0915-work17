@@ -188,6 +188,11 @@ class AuditModel:
     thresholds: object = None
     threshold_provenance: object = None
 
+    # 本次核查使用的企业规则包引用（RulePackRef；未使用规则包时为 None）
+    rule_pack: object = None
+    # 本次启用的问题种类集合（规则包关闭部分核查项时收窄；None=全部启用）
+    enabled_kinds: object = None
+
     def by_type(self, ifc_type: str) -> list[Element]:
         return [e for e in self.elements.values() if e.ifc_type == ifc_type]
 

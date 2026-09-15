@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 from shapely.geometry import Point
 
 from .model import AuditModel, RoomArea, Issue, DOOR, WINDOW
@@ -16,8 +18,15 @@ def _distance_to_room(point_xy, room_elem) -> float:
 
 
 def build_room_areas(model: AuditModel,
-                     th: Thresholds = DEFAULT_THRESHOLDS) -> AuditModel:
-    """按本次阈值统计房间净面积、门窗归属与面积偏差。"""
+                     th: Thresholds = DEFAULT_THRESHOLDS,
+                     enabled_kinds: Optional[set[str]] = None) -> AuditModel:
+    """按本次阈值统计房间净面积、门窗归属与面积偏差。
+
+    房间清单与门窗归属始终计算（门窗表依赖）；``enabled_kinds`` 给定时
+    只抑制面积类问题的产生（缺声明 / 偏差）。
+    """
+    emit_missing = enabled_kinds is None or "area_missing_declared" in enabled_kinds
+    emit_mismatch = enabled_kinds is None or "area_mismatch" in enabled_kinds
     declared = getattr(model, "_declared_areas", {})
     doors = model.by_type(DOOR)
     windows = model.by_type(WINDOW)
@@ -76,6 +85,8 @@ def build_room_areas(model: AuditModel,
     seq = 1
     for r in model.rooms:
         if not r.declared_area:
+            if not emit_missing:
+                continue
             model.issues.append(Issue(
                 issue_id=f"AREA-{seq:03d}",
                 severity="info",
@@ -91,7 +102,7 @@ def build_room_areas(model: AuditModel,
                 measure=r.net_area,
             ))
             seq += 1
-        elif r.deviation > th.area_dev_warn:
+        elif emit_mismatch and r.deviation > th.area_dev_warn:
             model.issues.append(Issue(
                 issue_id=f"AREA-{seq:03d}",
                 severity="warning",
