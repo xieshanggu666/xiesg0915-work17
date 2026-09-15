@@ -328,6 +328,84 @@ def run() -> int:
                         "--history", os.path.join(td, "hist4"), "-q"])
         check(rc4 == 2, "规则包与 --profile 同用退出码 2")
 
+        # ---- 8b) 自动选包也必须拦住冲突参数（不得静默忽略）----
+        def _n(k):
+            return os.path.join(td, k)
+
+        auto_base = ["batch", ifc_dir, "--project", "花园小区一期",
+                     "--stage", "completion", "--rule-lib", lib_dir,
+                     "-q", "--no-unit-reports"]
+
+        def _auto_rc(extra, tag):
+            return cli_main(auto_base + extra + ["-o", _n(f"o_{tag}"),
+                                                 "--history", _n(f"h_{tag}")])
+
+        # 修复点：以下参数在自动选包命中时都应退出码 2，且不得产出批次报告
+        check(_auto_rc(["--no-gate"], "nogate") == 2,
+              "自动选包 + --no-gate 被拦截（修复静默忽略）")
+        check(_auto_rc(["--profile", "strict"], "prof") == 2,
+              "自动选包 + --profile 被拦截")
+        check(_auto_rc(["--gate-profile", "loose"], "gp") == 2,
+              "自动选包 + --gate-profile 被拦截")
+        check(_auto_rc(["--gate-config", "/nonexistent/g.json"], "gc") == 2,
+              "自动选包 + --gate-config 被拦截")
+        check(_auto_rc(["--gate-set", "unit_max_warnings=99"], "gs") == 2,
+              "自动选包 + --gate-set 被拦截")
+        check(_auto_rc(["--config", "/nonexistent/t.json"], "cfg") == 2,
+              "自动选包 + --config 被拦截")
+        check(_auto_rc(["--set", "gap_min_len_mm=50"], "set") == 2,
+              "自动选包 + --set 被拦截")
+        check(not os.path.exists(_n("o_nogate")),
+              "冲突时不创建输出目录、不执行核查、不产出报告")
+
+        # 逃生口：--no-rule-pack 后普通参数照常生效
+        rc_esc = cli_main(auto_base + [
+            "--no-rule-pack", "--no-gate",
+            "-o", _n("o_esc"), "--history", _n("h_esc")])
+        check(rc_esc == 0, "--no-rule-pack + --no-gate 临时口径放行（退出码 0）")
+        bj_esc = [f for f in os.listdir(_n("o_esc")) if f.endswith(".json")]
+        esc_data = json.load(open(os.path.join(_n("o_esc"), bj_esc[0]),
+                                  encoding="utf-8"))
+        check(esc_data["rule_pack"] is None,
+              "临时口径批次不标注规则包（可追溯：本次未走企业规则包）")
+
+        # --rule-pack 与 --no-rule-pack 互斥
+        rc_mutex = cli_main(auto_base + [
+            "--rule-pack", "竣工审查包@1.0.0", "--no-rule-pack",
+            "-o", _n("o_mutex"), "--history", _n("h_mutex")])
+        check(rc_mutex == 2, "--rule-pack 与 --no-rule-pack 同用退出码 2")
+
+        # 自动选包无适用包时回退普通模式：手动参数必须照常生效（不算冲突）。
+        # 用独立空库，保证确实没有任何适用规则包。
+        fb_lib_dir = os.path.join(td, "fb_lib")
+        RulePackLibrary(fb_lib_dir).init()
+        rc_fb = cli_main(["batch", ifc_dir, "--project", "完全不相关项目",
+                          "--stage", "scheme", "--rule-lib", fb_lib_dir,
+                          "--no-gate", "-q", "--no-unit-reports",
+                          "-o", _n("o_fb"), "--history", _n("h_fb")])
+        check(rc_fb == 0, "无适用规则包自动回退后 --no-gate 照常生效（退出码 0）")
+        fb_jsons = [f for f in os.listdir(_n("o_fb")) if f.endswith(".json")]
+        fb_data = json.load(open(os.path.join(_n("o_fb"), fb_jsons[0]),
+                                 encoding="utf-8"))
+        check(fb_data["rule_pack"] is None, "回退批次不标注规则包")
+
+        # audit 子命令：显式规则包 + 阈值参数 -> 2
+        ifc_one = os.path.join(ifc_dir, "1号楼.ifc")
+        rc_a1 = cli_main(["audit", ifc_one,
+                          "--rule-pack", "竣工审查包@1.0.0", "--rule-lib", lib_dir,
+                          "--profile", "loose", "-o", _n("a1"), "-q"])
+        check(rc_a1 == 2, "audit 规则包与 --profile 同用退出码 2")
+        # audit 自动选择（--use-rule-pack）+ --set -> 2
+        rc_a2 = cli_main(["audit", ifc_one, "--use-rule-pack",
+                          "--project", "花园小区一期", "--stage", "completion",
+                          "--rule-lib", lib_dir,
+                          "--set", "gap_min_len_mm=50", "-o", _n("a2"), "-q"])
+        check(rc_a2 == 2, "audit 自动选包 + --set 被拦截（与批量共用同一套判定）")
+        # audit 默认不自动选包：--profile 正常生效（无规则包不冲突）
+        rc_a3 = cli_main(["audit", ifc_one, "--profile", "loose",
+                          "-o", _n("a3"), "-q"])
+        check(rc_a3 in (0, 1), "audit 不用规则包时 --profile 正常（向后兼容）")
+
         # rulepack 子命令
         rc5 = cli_main(["rulepack", "list", "--rule-lib", lib_dir])
         check(rc5 == 0, "rulepack list 正常")

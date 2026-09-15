@@ -54,7 +54,7 @@ def _add_rule_pack_args(parser, auto_flag: bool = False) -> None:
                         help="显式指定企业规则包：库内名称（最新版）、名称@版本，"
                              "或已发布快照 JSON 文件路径")
     if auto_flag:
-        parser.add_argument("--use-rule-pack", dest="rule_pack_auto",
+        parser.add_argument("--use-rule-pack", dest="use_rule_pack",
                             action="store_true",
                             help="不指定 --rule-pack 时，按项目/阶段从规则库"
                                  "自动选择适用的已发布规则包")
@@ -208,27 +208,79 @@ def _resolve_materialized(args, optional: bool = False) -> tuple[object, int]:
         return None, 2
 
 
-def _rule_pack_conflict(args) -> str:
-    """规则包与手动阈值 / 门禁参数互斥（保证报告版本可追溯）；返回冲突项描述。"""
-    conflicts = []
+def _rule_pack_conflict_items(args, include_gate: bool = True) -> list[str]:
+    """与规则包口径互斥的手动参数（保证“按哪个版本核查”可追溯）。
+
+    include_gate=False 用于没有门禁参数的 audit 子命令。
+    """
+    items = []
     if getattr(args, "profile", "default") != "default":
-        conflicts.append(f"--profile {args.profile}")
+        items.append(f"--profile {args.profile}")
     if getattr(args, "config", None):
-        conflicts.append(f"--config {args.config}")
+        items.append(f"--config {args.config}")
     if getattr(args, "set_threshold", None):
-        conflicts.append("--set")
-    if getattr(args, "gate_profile", "default") != "default":
-        conflicts.append(f"--gate-profile {args.gate_profile}")
-    if getattr(args, "gate_config", None):
-        conflicts.append("--gate-config")
-    if getattr(args, "gate_set", None):
-        conflicts.append("--gate-set")
-    return "、".join(conflicts)
+        items.append("--set")
+    if include_gate:
+        if getattr(args, "no_gate", False):
+            items.append("--no-gate")
+        if getattr(args, "gate_profile", "default") != "default":
+            items.append(f"--gate-profile {args.gate_profile}")
+        if getattr(args, "gate_config", None):
+            items.append("--gate-config")
+        if getattr(args, "gate_set", None):
+            items.append("--gate-set")
+    return items
+
+
+def _resolve_rule_pack_for_run(args, auto: bool,
+                               include_gate: bool = True,
+                               escape_hint: str = "") -> tuple[object, int]:
+    """audit / batch 共用的规则包选择 + 冲突判定。
+
+    流程：先判断是否要用规则包（显式 ``--rule-pack`` 优先；否则按
+    ``auto`` 决定是否按项目/阶段自动选择），**确认实际选到规则包后**再
+    检查手动阈值 / 门禁参数冲突——自动选包没有适用包而回退普通模式时，
+    普通参数照常生效，不算冲突。
+
+    Args:
+        escape_hint: 自动选包冲突时给出的“改用临时口径”操作提示
+            （batch 为 ``--no-rule-pack``，audit 为去掉 ``--use-rule-pack``）。
+
+    Returns:
+        (mat, rc)：``(None, 0)`` 表示本次不用规则包（调用方走普通模式）；
+        ``(mat, 0)`` 为已物化规则包；``(None, 2)`` 表示冲突或规则包错误。
+    """
+    explicit = bool(getattr(args, "rule_pack", None))
+    if not (explicit or auto):
+        return None, 0
+    if explicit and getattr(args, "no_rule_pack", False):
+        print("配置冲突：--rule-pack 与 --no-rule-pack 不能同时使用。",
+              file=sys.stderr)
+        return None, 2
+    # 自动选择允许“无适用包”回退；显式指定时任何错误都退出码 2
+    mat, rc = _resolve_materialized(args, optional=not explicit)
+    if rc or mat is None:
+        return mat, rc
+    # 已选到规则包：手动阈值/门禁参数不得再覆盖口径，否则报告虽标注版本、
+    # 实际口径却不是该版本，追溯链断裂
+    conflicts = _rule_pack_conflict_items(args, include_gate=include_gate)
+    if conflicts:
+        esc = f"\n  · {escape_hint}；" if (auto and escape_hint) else ""
+        print(
+            f"配置冲突：本次已{'显式指定' if explicit else '按项目/阶段自动选用'}"
+            f"企业规则包 {mat.ref.id}，不允许同时指定 "
+            f"{'、'.join(conflicts)}。\n"
+            "  · 要按规则包口径核查/放行：去掉上述冲突参数；"
+            f"{esc}"
+            "\n  · 需要不同的阈值或放行条件（含本次不阻断放行）："
+            "请调整并发布新版本的规则包（版本化留痕，可追溯）。",
+            file=sys.stderr)
+        return None, 2
+    return mat, 0
 
 
 def _cmd_audit(args) -> int:
     out_dir = args.output
-    os.makedirs(out_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(args.ifc))[0]
 
     def progress(pct, msg):
@@ -237,15 +289,16 @@ def _cmd_audit(args) -> int:
 
     try:
         overrides = parse_set_items(args.set_threshold)
-        if getattr(args, "rule_pack_auto", False) or getattr(args, "rule_pack", None):
-            conflict = _rule_pack_conflict(args)
-            if conflict:
-                print(f"配置冲突：使用规则包时不允许同时指定 {conflict}"
-                      "（规则包版本必须可追溯）", file=sys.stderr)
-                return 2
-            mat, rc = _resolve_materialized(args)
-            if rc:
-                return rc
+        auto = bool(getattr(args, "use_rule_pack", False))
+        mat, rc = _resolve_rule_pack_for_run(
+            args, auto=auto, include_gate=False,
+            escape_hint=("本次确实要改用命令行临时口径：去掉 --use-rule-pack"
+                         "（该次核查不标注规则包版本，不作为企业口径留痕）"))
+        if rc:
+            return rc
+        # 口径确定且无冲突后才创建输出目录
+        os.makedirs(out_dir, exist_ok=True)
+        if mat is not None:
             model = audit_ifc(
                 args.ifc, progress=progress if not args.quiet else None,
                 thresholds=mat.thresholds,
@@ -483,7 +536,6 @@ def _export_unit_reports(batch, out_dir, quiet, with_3d) -> None:
 
 def _cmd_batch(args) -> int:
     out_dir = args.output
-    os.makedirs(out_dir, exist_ok=True)
     history_dir = args.history or os.path.join("output", "batch_history")
 
     def progress(pct, msg):
@@ -493,22 +545,18 @@ def _cmd_batch(args) -> int:
     try:
         overrides = parse_set_items(args.set_threshold)
         gate_overrides = parse_gate_set_items(args.gate_set)
-        use_pack = args.rule_pack or (
-            getattr(args, "use_rule_pack", False)
-            and not getattr(args, "no_rule_pack", False))
-        mat = None
-        if use_pack:
-            if args.rule_pack:
-                conflict = _rule_pack_conflict(args)
-                if conflict:
-                    print(f"配置冲突：使用规则包时不允许同时指定 {conflict}"
-                          "（规则包版本必须可追溯）", file=sys.stderr)
-                    return 2
-            # 批量场景：库内没有适用规则包时静默回退普通模式（显式指定除外）
-            mat, rc = _resolve_materialized(
-                args, optional=not bool(args.rule_pack))
-            if rc:
-                return rc
+        # 批量默认按项目/阶段自动选包；--no-rule-pack 显式关闭自动选择。
+        # 显式 --rule-pack 与自动选包共用同一套冲突判定（含 --no-gate）。
+        auto = getattr(args, "use_rule_pack", True) \
+            and not getattr(args, "no_rule_pack", False)
+        mat, rc = _resolve_rule_pack_for_run(
+            args, auto=auto, include_gate=True,
+            escape_hint=("本次确实要改用命令行临时口径：显式加 --no-rule-pack"
+                         "（该次报告不标注规则包版本，不作为企业口径留痕）"))
+        if rc:
+            return rc
+        # 口径已确定（规则包或普通参数）且无冲突，才创建输出目录并执行
+        os.makedirs(out_dir, exist_ok=True)
         if mat is not None:
             batch = run_batch_with_rule_pack(
                 args.paths, mat,

@@ -169,7 +169,7 @@ python -m ifc_audit.cli rulepack deprecate 住宅施工图审查 1.0.0
 # 批量：默认就会按 --project/--stage 从规则库自动选择适用的已发布包
 python -m ifc_audit.cli batch ifc目录/ --project 花园小区一期 \
     --stage construction_drawing
-# 规则库中没有适用包时自动回退内置预设（--no-rule-pack 可显式关闭选择）
+# 规则库中没有适用包时自动回退内置预设；--no-rule-pack 可显式关闭自动选择
 
 # 显式指定：库内名称（取最新版）、名称@版本、或发布快照 JSON 文件
 python -m ifc_audit.cli batch ifc目录/ --project 花园小区一期 \
@@ -186,9 +186,14 @@ python -m ifc_audit.cli audit model.ifc --rule-pack 住宅施工图审查@1.0.0
 自动选择按**相关度打分**：项目精确命中 > 全项目；阶段精确命中 > 全阶段；
 同分取版本更高、发布更新者；已废止版本不参与。
 
-为保证报告版本严格可追溯，使用规则包时**不允许同时**指定
-`--profile/--config/--set/--gate-profile/--gate-config/--gate-set`
-（需要不同口径时应发布新版本的规则包），否则以退出码 2 报错。
+为保证报告版本严格可追溯，**只要本次实际按规则包核查（批量自动选中或
+显式 `--rule-pack`），就不允许同时指定**
+`--profile/--config/--set/--gate-profile/--gate-config/--gate-set/--no-gate`
+——这些参数不会被静默忽略，而是直接以退出码 2 报“配置冲突”并给出三种处理：
+去掉冲突参数按规则包口径执行、批量加 `--no-rule-pack`（audit 去掉
+`--use-rule-pack`）走不标注版本的命令行临时口径、或调整并发布新版本规则包。
+只有自动选择**没有命中任何适用包、回退内置预设**时，这些命令行参数才照常生效
+（该次报告 `rule_pack` 为空，本身即说明未使用企业规则包）。
 
 ### 报告中的版本标注
 
